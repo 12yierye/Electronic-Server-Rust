@@ -1,0 +1,26 @@
+[package]
+name = "electronic-server"
+version = "1.0.0"
+description = "Electronic application server - Rust port"
+authors = ["Electronic Team"]
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+md-5 = "0.10"
+tower = "0.5"
+futures = "0.3"
+dashmap = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+mime_guess = "2"
+regex = "1"
+num_cpus = "1"
+axum-extra = { version = "0.10", features = ["query"] }
