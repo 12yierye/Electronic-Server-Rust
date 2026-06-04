@@ -1,1 +1,17 @@
 /target
+/avatars
+/chat_messages
+/friend_requests
+/lan_chat_messages
+/lan_group_messages
+/lan_groups
+/pending_files
+/temp_chunks
+/uploaded_files
+/user_files
+broadcasts.*
+credentials.*
+org_tree.*
+pending_files_meta.*
+roles_config.*
+users.*
