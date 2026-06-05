@@ -262,6 +262,7 @@ pub async fn lan_friends(
                 "role": p.role,
                 "avatar": p.avatar,
                 "signature": p.signature,
+                "network_location": p.network_location,
                 "online": false
             })
         })

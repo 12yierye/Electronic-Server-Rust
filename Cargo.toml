@@ -24,3 +24,4 @@ mime_guess = "2"
 regex = "1"
 num_cpus = "1"
 axum-extra = { version = "0.10", features = ["query"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

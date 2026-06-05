@@ -21,6 +21,8 @@ pub struct RegisterReq {
     pub email: Option<String>,
     #[allow(dead_code)]
     pub role: Option<String>,
+    #[allow(dead_code)]
+    pub network_location: Option<String>,
 }
 
 fn get_users_store(base: &PathBuf) -> storage::JsonStore<Vec<User>> {
@@ -109,6 +111,7 @@ pub async fn register(
     }
 
     let max_id = users.iter().map(|u| u.id).max().unwrap_or(0);
+    let network_location = body.network_location.unwrap_or_else(|| "public".to_string());
     let new_user = User {
         id: max_id + 1,
         username: username.clone(),
@@ -125,6 +128,7 @@ pub async fn register(
         title: String::new(),
         subject: String::new(),
         managed_nodes: vec![],
+        network_location,
     };
 
     users.push(new_user);

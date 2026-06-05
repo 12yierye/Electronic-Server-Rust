@@ -197,6 +197,7 @@ pub async fn add_account(
         gender: "none".to_string(),
         starred_users: vec![],
         friends: vec![],
+        network_location: "public".to_string(),
     });
     write_users(&base, &users);
 

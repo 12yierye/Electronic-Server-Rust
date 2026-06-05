@@ -8,4 +8,5 @@ pub mod monitor;
 pub mod chunked;
 pub mod org;
 pub mod pending;
+pub mod sync;
 pub mod users;

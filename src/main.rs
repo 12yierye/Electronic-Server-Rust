@@ -15,6 +15,7 @@ mod handlers;
 mod middleware;
 mod models;
 mod storage;
+mod sync_client;
 mod ws;
 
 #[derive(Clone)]
@@ -200,6 +201,8 @@ async fn main() {
         .route("/api/server-info", get(handlers::monitor::server_info))
         .route("/api/statistics", get(handlers::monitor::statistics))
         .route("/api/events", get(handlers::monitor::events))
+        // Sync (master -> slave)
+        .route("/api/sync/users", get(handlers::sync::sync_users))
         // WebSocket
         .route("/ws", get(ws::ws_handler))
         // Home
@@ -211,12 +214,27 @@ async fn main() {
         ))
         .with_state(ctx);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
-    let addr = format!("0.0.0.0:{}", port);
+    let server_mode = std::env::var("SERVER_MODE").unwrap_or_else(|_| "master".to_string());
+    let is_master = server_mode == "master";
 
     tracing::info!("========================================");
     tracing::info!("      电子聊天系统服务端已启动 (Rust)");
     tracing::info!("========================================");
+    tracing::info!("Server mode: {}", server_mode);
+    if !is_master {
+        let master_url = std::env::var("MASTER_URL").expect("SLAVE mode requires MASTER_URL env");
+        let sync_secret = std::env::var("SYNC_SECRET").expect("SLAVE mode requires SYNC_SECRET env");
+        tracing::info!("Master URL: {}", master_url);
+        // Start background sync loop
+        let sync_base = base.clone();
+        tokio::spawn(async move {
+            sync_client::start_sync_loop(sync_base, master_url, sync_secret).await;
+        });
+    }
+
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+
     tracing::info!("HTTP port: {}", port);
     tracing::info!("Listening on: http://{}", addr);
 

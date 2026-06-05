@@ -31,6 +31,12 @@ pub struct User {
     pub subject: String,
     #[serde(default)]
     pub managed_nodes: Vec<String>,
+    #[serde(default = "default_network_location")]
+    pub network_location: String,
+}
+
+fn default_network_location() -> String {
+    "public".to_string()
 }
 
 fn default_role() -> String {
@@ -56,6 +62,8 @@ pub struct UserPublic {
     pub title: String,
     pub subject: String,
     pub managed_nodes: Vec<String>,
+    #[serde(default = "default_network_location")]
+    pub network_location: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub online: Option<bool>,
 }
@@ -77,6 +85,7 @@ impl From<User> for UserPublic {
             title: u.title,
             subject: u.subject,
             managed_nodes: u.managed_nodes,
+            network_location: u.network_location,
             online: None,
         }
     }
