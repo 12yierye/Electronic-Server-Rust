@@ -1,4 +1,7 @@
 /target
+data.sqlite3
+data.sqlite3-shm
+data.sqlite3-wal
 /avatars
 /chat_messages
 /friend_requests

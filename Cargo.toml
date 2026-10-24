@@ -25,3 +25,6 @@ regex = "1"
 num_cpus = "1"
 axum-extra = { version = "0.10", features = ["query"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rusqlite = { version = "0.32", features = ["bundled"] }

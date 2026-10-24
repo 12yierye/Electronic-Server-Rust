@@ -5,15 +5,19 @@ use crate::models::User;
 use crate::storage;
 
 async fn sync_users_from_master(base: &PathBuf, master_url: &str, secret: &str) {
-    let url = format!(
-        "{}/api/sync/users?secret={}",
-        master_url.trim_end_matches('/'),
-        secret
-    );
+    let url = format!("{}/api/sync/users", master_url.trim_end_matches('/'));
 
     tracing::info!("[Sync] Pulling users from master");
 
-    match reqwest::get(&url).await {
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("[Sync] Failed to build client: {}", e);
+            return;
+        }
+    };
+
+    match client.get(&url).header("x-sync-secret", secret).send().await {
         Ok(resp) => {
             if let Ok(data) = resp.json::<serde_json::Value>().await {
                 if data.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {

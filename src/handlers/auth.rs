@@ -1,11 +1,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use axum_extra::extract::Query;
 use serde::Deserialize;
 
+use crate::auth_store;
+use crate::middleware::auth_header;
 use crate::models::{AppState, User, UserPublic};
+use crate::security;
 use crate::storage;
 
 #[derive(Deserialize)]
@@ -51,28 +58,46 @@ pub async fn login(
         })));
     }
 
-    let users = read_users(&base);
-    if let Some(user) = users.iter().find(|u| u.username == username && u.password == password) {
-        storage::ensure_dir(base.join("user_files"));
-        let uf_path = base.join("user_files").join(format!("{}.json", username));
-        if !uf_path.exists() {
-            storage::write_json_array(&uf_path, &Vec::<crate::models::FileMeta>::new());
+    let mut users = read_users(&base);
+    let idx = match users.iter().position(|u| u.username == username) {
+        Some(i) => i,
+        None => {
+            return Ok(Json(serde_json::json!({
+                "success": false, "message": "用户名或密码错误"
+            })))
         }
+    };
 
-        state.online_users.insert(username.clone());
-        tracing::info!("User {} logged in", username);
-
-        let pub_user: UserPublic = user.clone().into();
+    let stored = users[idx].password.clone();
+    if !security::verify_password(stored.clone(), password.clone()).await {
         return Ok(Json(serde_json::json!({
-            "success": true,
-            "message": "登录成功",
-            "user": pub_user,
-            "pendingFiles": []
+            "success": false, "message": "用户名或密码错误"
         })));
     }
 
+    // 历史明文密码在登录成功后就地升级为哈希
+    if !security::is_hashed(&stored) {
+        users[idx].password = security::hash_password(password).await;
+        write_users(&base, &users);
+    }
+
+    storage::ensure_dir(base.join("user_files"));
+    let uf_path = base.join("user_files").join(format!("{}.json", username));
+    if !uf_path.exists() {
+        storage::write_json_array(&uf_path, &Vec::<crate::models::FileMeta>::new());
+    }
+
+    state.online_users.insert(username.clone());
+    let token = auth_store::issue_and_store(&base, &username);
+    tracing::info!("User {} logged in", username);
+
+    let pub_user: UserPublic = users[idx].clone().into();
     Ok(Json(serde_json::json!({
-        "success": false, "message": "用户名或密码错误"
+        "success": true,
+        "message": "登录成功",
+        "token": token,
+        "user": pub_user,
+        "pendingFiles": []
     })))
 }
 
@@ -115,7 +140,7 @@ pub async fn register(
     let new_user = User {
         id: max_id + 1,
         username: username.clone(),
-        password: password.clone(),
+        password: security::hash_password(password).await,
         email: email.clone(),
         name: username.clone(),
         role: "teacher".to_string(),
@@ -169,15 +194,14 @@ pub async fn logout_verify(
     }
 
     let users = read_users(&base);
-    if let Some(user) = users.iter().find(|u| u.username == username && u.password == password) {
+    let user = users.iter().find(|u| u.username == username);
+    let stored = user.map(|u| u.password.clone()).unwrap_or_default();
+
+    if security::verify_password(stored, password).await {
+        auth_store::revoke_user(&base, &username);
         return Ok(Json(serde_json::json!({
             "success": true,
-            "message": "验证成功",
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "role": user.role
-            }
+            "message": "验证成功"
         })));
     }
 
@@ -188,14 +212,20 @@ pub async fn logout_verify(
 
 pub async fn user_logout(
     State(state): State<Arc<AppState>>,
+    State(base): State<PathBuf>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let token = auth_header(&headers).unwrap_or_default();
+    auth_store::revoke_token(&base, &token);
+
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
     if username.is_empty() {
         return Ok(Json(serde_json::json!({
             "success": false, "message": "用户名不能为空"
         })));
     }
+
     state.online_users.remove(username);
     tracing::info!("User {} logged out", username);
     Ok(Json(serde_json::json!({

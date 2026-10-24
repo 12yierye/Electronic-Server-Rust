@@ -2,38 +2,38 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRef, State},
+    extract::{DefaultBodyLimit, State},
     middleware as axum_mw,
     routing::{delete, get, post, put},
     Json, Router,
 };
 use dashmap::DashMap;
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+mod auth_store;
 mod handlers;
 mod middleware;
 mod models;
+mod security;
 mod storage;
 mod sync_client;
 mod ws;
 
-#[derive(Clone)]
-struct AppContext {
-    pub state: Arc<models::AppState>,
-    pub base: PathBuf,
-}
+use models::AppContext;
 
-impl FromRef<AppContext> for Arc<models::AppState> {
-    fn from_ref(ctx: &AppContext) -> Self {
-        ctx.state.clone()
+fn origin_allowed(origin: &str) -> bool {
+    let configured = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
+    if !configured.is_empty() {
+        return configured
+            .split(',')
+            .map(|s| s.trim())
+            .any(|s| !s.is_empty() && s == origin);
     }
-}
-
-impl FromRef<AppContext> for PathBuf {
-    fn from_ref(ctx: &AppContext) -> Self {
-        ctx.base.clone()
-    }
+    origin == "null"
+        || origin.starts_with("http://localhost")
+        || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("https://12yierye.github.io")
 }
 
 #[tokio::main]
@@ -44,6 +44,7 @@ async fn main() {
 
     let base = std::env::current_dir().expect("Failed to get current dir");
     tracing::info!("Data directory: {:?}", base);
+    storage::init_db(&base);
 
     // Initialize data directories
     let dirs = [
@@ -82,10 +83,13 @@ async fn main() {
         std::fs::write(&groups_file, "[]").ok();
     }
 
+    security::migrate_plaintext_passwords(&base).await;
+
     let app_state = Arc::new(models::AppState {
         online_users: dashmap::DashSet::new(),
         lan_online_users: dashmap::DashSet::new(),
         ws_clients: DashMap::new(),
+        ws_seq: std::sync::atomic::AtomicU64::new(1),
         request_stats: Mutex::new(models::RequestStats {
             today_date: chrono::Utc::now().date_naive().to_string(),
             total_requests: 0,
@@ -104,7 +108,12 @@ async fn main() {
     };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin, _parts| {
+            origin
+                .to_str()
+                .map(origin_allowed)
+                .unwrap_or(false)
+        }))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -132,6 +141,7 @@ async fn main() {
         .route("/friends/requests/handle", post(handlers::users::handle_friend_request))
         // Profile & Avatar
         .route("/user/profile", post(handlers::users::update_profile))
+        .route("/user/{username}", get(handlers::users::get_user))
         .route("/user/avatar/upload", post(handlers::users::upload_avatar))
         .route("/user/avatar/{username}", get(handlers::users::get_avatar))
         .route("/user/avatar/{username}", delete(handlers::users::delete_avatar))
@@ -212,6 +222,11 @@ async fn main() {
             ctx.clone(),
             middleware::stats_middleware,
         ))
+        .layer(axum_mw::from_fn_with_state(
+            ctx.clone(),
+            middleware::require_auth,
+        ))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(ctx);
 
     let server_mode = std::env::var("SERVER_MODE").unwrap_or_else(|_| "master".to_string());

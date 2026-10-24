@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::Extension, extract::State, http::StatusCode, Json};
 use axum_extra::extract::Query;
 
+use crate::middleware::AuthUser;
 use crate::models::{FriendRequest, User, UserPublic};
 use crate::storage;
+
+fn is_self(auth: &Option<Extension<AuthUser>>, username: &str) -> bool {
+    auth.as_ref().map(|Extension(u)| u.0 == username).unwrap_or(false)
+}
 
 fn get_users_store(base: &PathBuf) -> storage::JsonStore<Vec<User>> {
     storage::JsonStore::new(base.join("users.json"))
@@ -69,10 +74,17 @@ pub async fn search_users(
 
 pub async fn add_friend(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let current = body.get("currentUser").and_then(|v| v.as_str()).unwrap_or("");
     let friend = body.get("friendUsername").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !is_self(&auth, current) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权以他人身份操作"
+        })));
+    }
 
     let mut users = read_users(&base);
     let ui = users.iter().position(|u| u.username == current);
@@ -102,10 +114,17 @@ pub async fn add_friend(
 
 pub async fn remove_friend(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let current = body.get("currentUser").and_then(|v| v.as_str()).unwrap_or("");
     let friend = body.get("friendUsername").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !is_self(&auth, current) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权以他人身份操作"
+        })));
+    }
 
     let mut users = read_users(&base);
     let ui = users.iter().position(|u| u.username == current);
@@ -158,10 +177,17 @@ pub async fn get_friends(
 
 pub async fn star_user(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let current = body.get("currentUser").and_then(|v| v.as_str()).unwrap_or("");
     let target = body.get("starredUsername").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !is_self(&auth, current) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权以他人身份操作"
+        })));
+    }
 
     let mut users = read_users(&base);
     let ui = users.iter().position(|u| u.username == current);
@@ -188,12 +214,18 @@ pub async fn star_user(
 
 pub async fn get_starred(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
     if username.is_empty() {
         return Ok(Json(serde_json::json!({
             "success": false, "message": "用户名不能为空"
+        })));
+    }
+    if !is_self(&auth, username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权查看他人星标"
         })));
     }
     let users = read_users(&base);
@@ -214,14 +246,41 @@ pub async fn get_starred(
     }
 }
 
+pub async fn get_user(
+    axum::extract::Path(username): axum::extract::Path<String>,
+    State(base): State<PathBuf>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !storage::is_safe_segment(&username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "用户名非法"
+        })));
+    }
+    let users = read_users(&base);
+    match users.iter().find(|u| u.username == username) {
+        Some(user) => Ok(Json(serde_json::json!({
+            "success": true,
+            "user": to_public(user)
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "success": false, "message": "用户不存在"
+        }))),
+    }
+}
+
 pub async fn update_profile(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
     if username.is_empty() {
         return Ok(Json(serde_json::json!({
             "success": false, "message": "用户名不能为空"
+        })));
+    }
+    if !is_self(&auth, username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权修改他人资料"
         })));
     }
 
@@ -280,6 +339,7 @@ fn regex_match(pattern: &str, s: &str) -> bool {
 // Avatar
 pub async fn upload_avatar(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Query(params): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -287,6 +347,16 @@ pub async fn upload_avatar(
     if username.is_empty() {
         return Ok(Json(serde_json::json!({
             "success": false, "message": "用户名不能为空"
+        })));
+    }
+    if !is_self(&auth, username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权修改他人头像"
+        })));
+    }
+    if !storage::is_safe_segment(username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "用户名非法"
         })));
     }
     if body.is_empty() {
@@ -322,6 +392,9 @@ pub async fn get_avatar(
     axum::extract::Path(username): axum::extract::Path<String>,
     State(base): State<PathBuf>,
 ) -> Result<(axum::http::StatusCode, [(String, String); 2], Vec<u8>), StatusCode> {
+    if !storage::is_safe_segment(&username) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let avatar_path = base.join("avatars").join(format!("{}.jpg", username));
     if avatar_path.exists() {
         let data = std::fs::read(&avatar_path).map_err(|_| StatusCode::NOT_FOUND)?;
@@ -341,7 +414,18 @@ pub async fn get_avatar(
 pub async fn delete_avatar(
     axum::extract::Path(username): axum::extract::Path<String>,
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !is_self(&auth, &username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权删除他人头像"
+        })));
+    }
+    if !storage::is_safe_segment(&username) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "用户名非法"
+        })));
+    }
     let avatar_path = base.join("avatars").join(format!("{}.jpg", username));
     if avatar_path.exists() {
         let _ = std::fs::remove_file(&avatar_path);
@@ -364,10 +448,17 @@ fn get_fr_path(base: &PathBuf, username: &str) -> std::path::PathBuf {
 
 pub async fn send_friend_request(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let sender = body.get("sender").and_then(|v| v.as_str()).unwrap_or("");
     let receiver = body.get("receiver").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !is_self(&auth, sender) {
+        return Ok(Json(serde_json::json!({
+            "success": false, "message": "无权以他人身份发送好友申请"
+        })));
+    }
 
     let users = read_users(&base);
     let sender_user = users.iter().find(|u| u.username == sender);

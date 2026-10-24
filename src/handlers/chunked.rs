@@ -1,20 +1,28 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use axum::{body::Bytes, extract::State, http::StatusCode, Json};
+use axum::body::Bytes;
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::Json;
 use axum_extra::extract::Query;
 
+use crate::middleware::AuthUser;
 use crate::models::FileMeta;
 use crate::storage;
+
+fn is_md5(s: &str) -> bool {
+    s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
 
 pub async fn query_chunks(
     State(base): State<PathBuf>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let md5 = params.get("md5").map(|s| s.as_str()).unwrap_or("");
-    if md5.is_empty() {
+    if !is_md5(md5) {
         return Ok(serde_json::json!({
-            "success": false, "message": "md5参数不能为空"
+            "success": false, "message": "md5参数不能为空或格式错误"
         }).into());
     }
 
@@ -60,6 +68,11 @@ pub async fn upload_chunk(
             "success": false, "message": "参数无效"
         }).into());
     }
+    if !is_md5(md5) || !storage::is_safe_segment(file_name) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "参数非法"
+        }).into());
+    }
 
     let chunk_dir = base.join("temp_chunks").join(md5);
     storage::ensure_dir(&chunk_dir);
@@ -76,6 +89,7 @@ pub async fn upload_chunk(
 
 pub async fn merge_chunks(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let md5 = body.get("md5").and_then(|v| v.as_str()).unwrap_or("");
@@ -86,6 +100,17 @@ pub async fn merge_chunks(
     if md5.is_empty() || file_name.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "参数无效"
+        }).into());
+    }
+    if !is_md5(md5) || !storage::is_safe_segment(file_name) || (!username.is_empty() && !storage::is_safe_segment(username)) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "参数非法"
+        }).into());
+    }
+    let is_self = auth.as_ref().map(|Extension(u)| u.0 == username).unwrap_or(false);
+    if !username.is_empty() && !is_self {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权为其他用户上传文件"
         }).into());
     }
 

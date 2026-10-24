@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, Json};
 use axum_extra::extract::Query;
 use chrono::Utc;
 
-use crate::models::{ChatMessage, Group};
+use crate::models::{AppState, ChatMessage, Group};
 use crate::storage;
 
 pub async fn create_group(
@@ -89,6 +90,11 @@ pub async fn get_group_messages(
             "success": false, "message": "群ID不能为空"
         }).into());
     }
+    if !storage::is_safe_segment(group_id) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "群ID非法"
+        }).into());
+    }
 
     let msg_path = base.join("lan_group_messages").join(format!("{}.json", group_id));
     let messages: Vec<ChatMessage> = if msg_path.exists() {
@@ -104,6 +110,7 @@ pub async fn get_group_messages(
 }
 
 pub async fn send_group_message(
+    State(state): State<Arc<AppState>>,
     State(base): State<PathBuf>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -154,6 +161,25 @@ pub async fn send_group_message(
             storage::write_json_array(&msg_path, &messages);
 
             tracing::info!("[Group Msg] {} in {}: {}", from, g.name, &message[..message.len().min(50)]);
+
+            let payload = serde_json::json!({
+                "type": "new_group_message",
+                "conversation": { "target": group_id, "groupName": g.name },
+                "message": {
+                    "id": msg.id,
+                    "from": from,
+                    "message": message,
+                    "timestamp": msg.timestamp,
+                    "groupId": group_id,
+                    "groupName": g.name
+                }
+            })
+            .to_string();
+            for member in &g.members {
+                if member != from {
+                    crate::ws::notify_user(&state, member, &payload);
+                }
+            }
 
             Ok(serde_json::json!({
                 "success": true,

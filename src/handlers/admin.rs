@@ -6,10 +6,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use chrono::Utc;
 
+use crate::auth_store;
 use crate::middleware::auth_header;
-use crate::models::{AppState, Credential, RoleConfig, User};
+use crate::models::{AppState, RoleConfig, User};
+use crate::security;
 use crate::storage;
 
 fn read_users(base: &PathBuf) -> Vec<User> {
@@ -18,14 +19,6 @@ fn read_users(base: &PathBuf) -> Vec<User> {
 
 fn write_users(base: &PathBuf, users: &Vec<User>) {
     storage::JsonStore::new(base.join("users.json")).write(users);
-}
-
-fn read_credentials(base: &PathBuf) -> Vec<Credential> {
-    storage::JsonStore::new(base.join("credentials.json")).read()
-}
-
-fn write_credentials(base: &PathBuf, creds: &Vec<Credential>) {
-    storage::JsonStore::new(base.join("credentials.json")).write(creds);
 }
 
 pub async fn admin_login(
@@ -41,82 +34,44 @@ pub async fn admin_login(
         })));
     }
 
-    let users = read_users(&base);
-
-    if username == "admin" {
-        if users.iter().any(|u| u.username == "admin" && u.password == password) {
-            let token = create_token(username);
-            let mut credentials = read_credentials(&base);
-            credentials.retain(|c| c.username != username);
-            credentials.push(Credential {
-                username: username.to_string(),
-                token: token.clone(),
-                created_at: Utc::now().timestamp_millis() as u64,
-            });
-            write_credentials(&base, &credentials);
+    let mut users = read_users(&base);
+    let idx = match users.iter().position(|u| u.username == username) {
+        Some(i) => i,
+        None => {
             return Ok(Json(serde_json::json!({
-                "success": true, "token": token, "username": username, "role": "admin"
-            })));
+                "success": false, "message": "用户不存在"
+            })))
         }
+    };
+
+    let stored = users[idx].password.clone();
+    if !security::verify_password(stored.clone(), password.to_string()).await {
         return Ok(Json(serde_json::json!({
-            "success": false, "message": "管理员密码错误"
+            "success": false,
+            "message": if username == "admin" { "管理员密码错误" } else { "密码错误" }
         })));
     }
 
-    let user = users.iter().find(|u| u.username == username);
-    match user {
-        Some(u) if u.password == password => {
-            let token = create_token(username);
-            let mut credentials = read_credentials(&base);
-            credentials.retain(|c| c.username != username);
-            credentials.push(Credential {
-                username: username.to_string(),
-                token: token.clone(),
-                created_at: Utc::now().timestamp_millis() as u64,
-            });
-            write_credentials(&base, &credentials);
-            Ok(Json(serde_json::json!({
-                "success": true, "token": token, "username": username, "role": u.role
-            })))
-        }
-        Some(_) => Ok(Json(serde_json::json!({
-            "success": false, "message": "密码错误"
-        }))),
-        None => Ok(Json(serde_json::json!({
-            "success": false, "message": "用户不存在"
-        }))),
+    if !security::is_hashed(&stored) {
+        users[idx].password = security::hash_password(password.to_string()).await;
+        write_users(&base, &users);
     }
-}
 
-fn create_token(username: &str) -> String {
-    format!("{}:{}:{}", username, Utc::now().timestamp_millis(), &random_str(12))
-}
+    let role = users[idx].role.clone();
+    let token = auth_store::issue_and_store(&base, username);
 
-fn verify_token(base: &PathBuf, token: &str) -> Option<String> {
-    let credentials = read_credentials(base);
-    let cred = credentials.iter().find(|c| c.token == token)?;
-    let thirty_days: u64 = 30 * 24 * 60 * 60 * 1000;
-    if Utc::now().timestamp_millis() as u64 - cred.created_at > thirty_days {
-        let mut all = credentials;
-        all.retain(|c| c.token != token);
-        write_credentials(base, &all);
-        return None;
-    }
-    Some(cred.username.clone())
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "token": token,
+        "username": username,
+        "role": if username == "admin" { "admin".to_string() } else { role }
+    })))
 }
 
 pub async fn get_accounts(
     State(base): State<PathBuf>,
     State(_state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let token = auth_header(&headers).unwrap_or_default();
-    if verify_token(&base, &token).is_none() {
-        return Ok(Json(serde_json::json!({
-            "success": false, "message": "未提供凭证或凭证无效"
-        })));
-    }
-
     let users = read_users(&base);
     let publics: Vec<serde_json::Value> = users.iter().map(|u| {
         serde_json::json!({
@@ -145,19 +100,22 @@ pub async fn add_account(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let token = auth_header(&headers).unwrap_or_default();
-    let auth_user = verify_token(&base, &token);
-    if auth_user.is_none() {
-        return Ok(Json(serde_json::json!({
-            "success": false, "message": "未提供凭证或凭证无效"
-        })));
-    }
+    let auth_user = auth_store::verify_token(&base, &token).unwrap_or_default();
 
     let users = read_users(&base);
-    let current_user = users.iter().find(|u| u.username == auth_user.as_deref().unwrap_or(""));
     let roles_config: RoleConfig = storage::JsonStore::new(base.join("roles_config.json")).read();
-    let role_obj = roles_config.roles.iter().find(|r| r.id == current_user.map(|u| u.role.as_str()).unwrap_or("guest"));
-    let can_manage = role_obj.map(|r| r.permissions.contains(&"manage_users".to_string())).unwrap_or(false);
-    if !can_manage && auth_user.as_deref() != Some("admin") {
+    let role_id = users
+        .iter()
+        .find(|u| u.username == auth_user)
+        .map(|u| u.role.clone())
+        .unwrap_or_else(|| "guest".to_string());
+    let can_manage = roles_config
+        .roles
+        .iter()
+        .find(|r| r.id == role_id)
+        .map(|r| r.permissions.contains(&"manage_users".to_string()))
+        .unwrap_or(false);
+    if !can_manage && auth_user != "admin" {
         return Ok(Json(serde_json::json!({
             "success": false, "message": "权限不足"
         })));
@@ -184,7 +142,7 @@ pub async fn add_account(
     users.push(User {
         id: max_id + 1,
         username: new_username.to_string(),
-        password: new_password.to_string(),
+        password: security::hash_password(new_password.to_string()).await,
         email: body.get("email").and_then(|v| v.as_str()).unwrap_or(&format!("{}@local", new_username)).to_string(),
         name: body.get("name").and_then(|v| v.as_str()).unwrap_or(new_username).to_string(),
         role: new_role.to_string(),
@@ -219,14 +177,9 @@ pub async fn delete_account(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let token = auth_header(&headers).unwrap_or_default();
-    let auth_user = verify_token(&base, &token);
-    if auth_user.is_none() {
-        return Ok(Json(serde_json::json!({
-            "success": false, "message": "未提供凭证或凭证无效"
-        })));
-    }
+    let auth_user = auth_store::verify_token(&base, &token).unwrap_or_default();
 
-    if target == auth_user.as_deref().unwrap_or("") {
+    if target == auth_user {
         return Ok(Json(serde_json::json!({
             "success": false, "message": "不能删除自己的账户"
         })));
@@ -238,9 +191,7 @@ pub async fn delete_account(
         Some(pos) => {
             users.remove(pos);
             write_users(&base, &users);
-            let mut credentials = read_credentials(&base);
-            credentials.retain(|c| c.username != target);
-            write_credentials(&base, &credentials);
+            auth_store::revoke_user(&base, &target);
             Ok(Json(serde_json::json!({
                 "success": true, "message": format!("用户 {} 已删除", target)
             })))
@@ -254,16 +205,8 @@ pub async fn delete_account(
 pub async fn update_account(
     axum::extract::Path(target): axum::extract::Path<String>,
     State(base): State<PathBuf>,
-    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let token = auth_header(&headers).unwrap_or_default();
-    if verify_token(&base, &token).is_none() {
-        return Ok(Json(serde_json::json!({
-            "success": false, "message": "未提供凭证或凭证无效"
-        })));
-    }
-
     let mut users = read_users(&base);
     let pos = users.iter().position(|u| u.username == target);
 
@@ -277,6 +220,15 @@ pub async fn update_account(
             if let Some(v) = body.get("managedNodes").and_then(|v| v.as_array()) {
                 users[pos].managed_nodes = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
             }
+
+            // 管理员重置密码，重置后原凭证立即失效
+            if let Some(pw) = body.get("password").and_then(|v| v.as_str()) {
+                if !pw.is_empty() {
+                    users[pos].password = security::hash_password(pw.to_string()).await;
+                    auth_store::revoke_user(&base, &target);
+                }
+            }
+
             let resp_user = serde_json::json!({
                 "username": users[pos].username,
                 "name": users[pos].name,
@@ -319,14 +271,4 @@ pub async fn account_stats(
         "totalUsers": users.len(),
         "onlineUsers": state.online_users.len()
     })))
-}
-
-fn random_str(len: usize) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-    (0..len).map(|i| {
-        let idx = (seed.wrapping_mul(i as u64 + 1).wrapping_add(seed >> (i % 8))) as usize % chars.len();
-        chars[idx]
-    }).collect()
 }

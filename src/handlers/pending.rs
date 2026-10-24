@@ -2,14 +2,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use axum::{body::Bytes, extract::State, http::StatusCode, Json};
+use axum::extract::Extension;
 use axum_extra::extract::Query;
 use chrono::Utc;
 
+use crate::middleware::AuthUser;
 use crate::models::PendingFileMeta;
 use crate::storage;
 
+fn is_self(auth: &Option<Extension<AuthUser>>, username: &str) -> bool {
+    auth.as_ref().map(|Extension(u)| u.0 == username).unwrap_or(false)
+}
+
 pub async fn store_pending_file(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Parse sender/receiver/filename/expireAt from query params or body
@@ -27,6 +34,11 @@ pub async fn store_pending_file(
     if sender.is_empty() || receiver.is_empty() || filename.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "发送者、接收者和文件名不能为空"
+        }).into());
+    }
+    if !is_self(&auth, sender) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权以他人身份暂存文件"
         }).into());
     }
 
@@ -72,12 +84,18 @@ pub async fn store_pending_file(
 
 pub async fn get_pending_files(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let receiver = params.get("receiver").map(|s| s.as_str()).unwrap_or("");
     if receiver.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "接收者用户名不能为空"
+        }).into());
+    }
+    if !is_self(&auth, receiver) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权查看其他用户文件"
         }).into());
     }
 
@@ -110,7 +128,11 @@ pub async fn get_pending_files(
 pub async fn download_pending_file(
     axum::extract::Path(file_id): axum::extract::Path<String>,
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
 ) -> Result<(StatusCode, [(String, String); 2], Vec<u8>), StatusCode> {
+    if !storage::is_safe_segment(&file_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let meta_path = base.join("pending_files_meta.json");
     let pending: Vec<PendingFileMeta> = if meta_path.exists() {
         storage::read_json_array(&meta_path)
@@ -119,7 +141,11 @@ pub async fn download_pending_file(
     };
 
     let meta = pending.iter().find(|f| f.id == file_id).ok_or(StatusCode::NOT_FOUND)?;
-    let file_path = base.join("pending_files").join(&file_id);
+    let allowed = is_self(&auth, &meta.receiver) || is_self(&auth, &meta.sender);
+    if !allowed {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let file_path = storage::safe_join(&base.join("pending_files"), &[&file_id]).ok_or(StatusCode::BAD_REQUEST)?;
 
     let data = std::fs::read(&file_path).map_err(|_| StatusCode::NOT_FOUND)?;
 
@@ -136,7 +162,11 @@ pub async fn download_pending_file(
 pub async fn delete_pending_file(
     axum::extract::Path(file_id): axum::extract::Path<String>,
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !storage::is_safe_segment(&file_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let meta_path = base.join("pending_files_meta.json");
     let mut pending: Vec<PendingFileMeta> = if meta_path.exists() {
         storage::read_json_array(&meta_path)
@@ -145,6 +175,10 @@ pub async fn delete_pending_file(
     };
 
     let fi = pending.iter().position(|f| f.id == file_id).ok_or(StatusCode::NOT_FOUND)?;
+    let allowed = is_self(&auth, &pending[fi].receiver) || is_self(&auth, &pending[fi].sender);
+    if !allowed {
+        return Err(StatusCode::FORBIDDEN);
+    }
     pending.remove(fi);
     storage::write_json_array(&meta_path, &pending);
 
@@ -160,10 +194,16 @@ pub async fn delete_pending_file(
 
 pub async fn file_status(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let filename = params.get("filename").map(|s| s.as_str()).unwrap_or("");
     let receiver = params.get("receiver").map(|s| s.as_str()).unwrap_or("");
+    if !is_self(&auth, receiver) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权查询其他用户文件"
+        }).into());
+    }
 
     let meta_path = base.join("pending_files_meta.json");
     let pending: Vec<PendingFileMeta> = if meta_path.exists() {

@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::Extension, extract::State, http::StatusCode, Json};
 use axum_extra::extract::Query;
 use chrono::Utc;
 
-use crate::models::ChatMessage;
+use crate::middleware::AuthUser;
+use crate::models::{AppState, ChatMessage};
 use crate::storage;
+
+fn is_self(auth: &Option<Extension<AuthUser>>, username: &str) -> bool {
+    auth.as_ref().map(|Extension(u)| u.0 == username).unwrap_or(false)
+}
 
 fn get_avatar_url(base: &PathBuf, username: &str) -> String {
     let users: Vec<crate::models::User> = storage::JsonStore::new(base.join("users.json")).read();
@@ -22,7 +28,9 @@ fn enrich_with_avatar(base: &PathBuf, mut msgs: Vec<ChatMessage>) -> Vec<ChatMes
 }
 
 pub async fn send_message(
+    State(state): State<Arc<AppState>>,
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let sender = body.get("sender").and_then(|v| v.as_str()).unwrap_or("");
@@ -32,6 +40,11 @@ pub async fn send_message(
     if sender.is_empty() || receiver.is_empty() || message.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "发送者、接收者和消息内容不能为空"
+        }).into());
+    }
+    if !is_self(&auth, sender) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权以他人身份发送消息"
         }).into());
     }
 
@@ -74,21 +87,25 @@ pub async fn send_message(
     let mut resp_msg = msg.clone();
     resp_msg.sender_avatar = get_avatar_url(&base, sender);
 
-    let _state = axum::extract::State(std::sync::Arc::new(crate::models::AppState {
-        online_users: dashmap::DashSet::new(),
-        lan_online_users: dashmap::DashSet::new(),
-        ws_clients: dashmap::DashMap::new(),
-        request_stats: tokio::sync::Mutex::new(crate::models::RequestStats {
-            today_date: String::new(),
-            total_requests: 0,
-            error_requests: 0,
-            peak_concurrency: 0,
-            current_concurrency: 0,
-            data_transfer_bytes: 0,
-        }),
-        cached_cpu_usage: tokio::sync::Mutex::new(0.0),
-        prev_cpu: tokio::sync::Mutex::new(None),
-    }));
+    crate::ws::notify_user(
+        &state,
+        receiver,
+        &serde_json::json!({
+            "type": "new_message",
+            "conversation": { "target": receiver, "sender": sender },
+            "message": {
+                "id": msg.id,
+                "sender": sender,
+                "receiver": receiver,
+                "from": sender,
+                "to": receiver,
+                "message": message,
+                "timestamp": msg.timestamp,
+                "senderAvatar": resp_msg.sender_avatar
+            }
+        })
+        .to_string(),
+    );
 
     Ok(serde_json::json!({
         "success": true,
@@ -99,6 +116,7 @@ pub async fn send_message(
 
 pub async fn get_messages(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let sender = params.get("sender").map(|s| s.as_str()).unwrap_or("");
@@ -107,6 +125,11 @@ pub async fn get_messages(
     if sender.is_empty() || receiver.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "发送者和接收者不能为空"
+        }).into());
+    }
+    if !is_self(&auth, sender) && !is_self(&auth, receiver) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权查看他人会话"
         }).into());
     }
 
@@ -128,6 +151,7 @@ pub async fn get_messages(
 
 pub async fn mark_read(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
@@ -136,6 +160,11 @@ pub async fn mark_read(
     if username.is_empty() || target.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "用户名和目标用户不能为空"
+        }).into());
+    }
+    if !is_self(&auth, username) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权操作他人会话"
         }).into());
     }
 
@@ -164,6 +193,7 @@ pub async fn mark_read(
 
 pub async fn mark_read_group(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
@@ -172,6 +202,16 @@ pub async fn mark_read_group(
     if username.is_empty() || group_id.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "用户名和群ID不能为空"
+        }).into());
+    }
+    if !is_self(&auth, username) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权操作他人会话"
+        }).into());
+    }
+    if !storage::is_safe_segment(group_id) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "群ID非法"
         }).into());
     }
 
@@ -363,12 +403,18 @@ pub async fn lan_online(
 
 pub async fn unread_counts_get(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
     if username.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "用户名不能为空"
+        }).into());
+    }
+    if !is_self(&auth, username) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权查看他人未读数"
         }).into());
     }
 
@@ -418,6 +464,7 @@ pub async fn unread_counts_get(
 
 pub async fn unread_counts_post(
     State(base): State<PathBuf>,
+    auth: Option<Extension<AuthUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
@@ -426,6 +473,11 @@ pub async fn unread_counts_post(
     if username.is_empty() {
         return Ok(serde_json::json!({
             "success": false, "message": "用户名不能为空"
+        }).into());
+    }
+    if !is_self(&auth, username) {
+        return Ok(serde_json::json!({
+            "success": false, "message": "无权更新他人未读数"
         }).into());
     }
 

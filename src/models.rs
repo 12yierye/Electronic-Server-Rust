@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
+use axum::extract::FromRef;
+
+pub type WsSender = tokio::sync::mpsc::UnboundedSender<String>;
 
 // ── User ──
 
@@ -246,8 +252,28 @@ pub struct CpuSnapshot {
 pub struct AppState {
     pub online_users: dashmap::DashSet<String>,
     pub lan_online_users: dashmap::DashSet<String>,
-    pub ws_clients: dashmap::DashMap<String, HashSet<String>>,
+    pub ws_clients: dashmap::DashMap<String, Vec<(u64, WsSender)>>,
+    pub ws_seq: AtomicU64,
     pub request_stats: tokio::sync::Mutex<RequestStats>,
     pub cached_cpu_usage: tokio::sync::Mutex<f64>,
     pub prev_cpu: tokio::sync::Mutex<Option<CpuSnapshot>>,
 }
+
+#[derive(Clone)]
+pub struct AppContext {
+    pub state: Arc<AppState>,
+    pub base: PathBuf,
+}
+
+impl FromRef<AppContext> for Arc<AppState> {
+    fn from_ref(ctx: &AppContext) -> Self {
+        ctx.state.clone()
+    }
+}
+
+impl FromRef<AppContext> for PathBuf {
+    fn from_ref(ctx: &AppContext) -> Self {
+        ctx.base.clone()
+    }
+}
+
